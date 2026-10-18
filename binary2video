@@ -234,6 +234,7 @@ def run_or_die(cmd, what):
 
 def load_rs():
     """Import b2v_rs.py from this script's directory (keeps -y self-locating)."""
+    sys.dont_write_bytecode = True                  # no __pycache__/ litter
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import b2v_rs
