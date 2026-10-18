@@ -1,44 +1,46 @@
 #!/usr/bin/env python3
-# binary2video (v3, python) -- pack any binary file inside a VALID video
-# (and its audio track!) and recover it exactly with video2binary.
+# binary2video (v4, python) -- pack any binary file inside a VALID video
+# (and its audio tracks!) and recover it exactly with video2binary.
 #
 # Every payload byte is stored in raw RGB-24 pixels and raw signed 16-bit
 # PCM samples, coded with a LOSSLESS codec, so unpacking is bit-exact.
 #
 # PAYLOAD FORMAT (ASCII header inside the first video frame; the container
 # wraps it, so peek with:
-#   ffmpeg -i out.mkv -f rawvideo -pix_fmt rgb24 -  |  head -c 50 ):
-#   "B2V2" + flag + orig_len(15 digits) + video_bytes(15) + audio_bytes(15)
+#   ffmpeg -i out.mkv -f rawvideo -pix_fmt rgb24 -  |  head -c 54 ):
+#   "B2V3" + flag + orig_len(15) + video_bytes(15) + audio_bytes(15)
+#          + channels(2) + tracks(2)
 #     flag 'r' = stream is raw data       'z' = stream is gzipped data
-#   The stored stream is split over both tracks:
-#     video raw: header(50) + stream[:video_bytes], zero-padded to whole frames
-#     audio raw: stream[video_bytes:], mono 48000 Hz s16le PCM
-#   Unpack = concatenate the two parts, then (z) gunzip / (r) truncate to orig_len.
-#   'B2V1' header = old video-only format (35 bytes), still unpackable. Videos
-#   with no header at all = the original gzip+pad format, still unpackable.
+#   The stored stream is split over all tracks:
+#     video raw: header + stream[:video_bytes], zero-padded to whole frames
+#     audio: the remaining stream[*], spread over `tracks` audio tracks of
+#            `channels` interleaved 48 kHz s16le channels each
+#   Unpack = concatenate the parts in order, then (z) gunzip / (r) truncate.
+#   Older formats still unpack: 'B2V2' (1 track, mono), 'B2V1' (video-only
+#   35-byte header) and headerless videos = the original gzip+pad scheme.
 #
-# WHY THE AUDIO TRACK HELPS: per second, the video track holds
-#   fps * width * height * 3  bytes, the audio adds  2 * 48000 = 96 kB/s.
-# The packer splits the stream between both tracks so that video and audio
-# play for the same time -> minimum duration, i.e. maximum bytes/second.
-# (Example: 320x240@1fps + audio: 230,400 B/s video vs 326,400 B/s combined.)
+# AUDIO CAPACITY (the fun part): one mono track adds 96,000 B/s. The packer
+# splits the stream between video and audio so both play for the same time
+# -> minimum duration, i.e. maximum data density. `-m` widens channels
+# (5.1 = 6, 7.1 = 8), `-t` stacks extra tracks; capacity = t x m x 96 kB/s.
+# (Example: 320x240@1fps, 1 track, 7.1 audio: 230.4 kB/s video + 768 kB/s
+# audio. With 4 tracks x 7.1: 3.3 MB/s combined.)
 #
 # CODEC GUIDE (1 MiB random data, 320x240, .mkv output):
-#   png  (default)  ~0.92 MiB  best density; Deflate passes noise ~1:1
+#   png  (default)  ~0.92 MiB  best density; zlib passes noise ~1:1
 #   vp9             ~1.13 MiB  the only codec allowed in .webm
 #   ffv1 / ffv1l3   ~1.18 MiB  fastest; ffv1l3 = slice-parallel
 #   h264            ~1.55 MiB  most player-friendly (CABAC + qp 0)
 #   All verified bit-exact over full pack/unpack roundtrips.
 #
 # Usage:
-#   binary2video [-f fps] [-w width] [-h height] [-c png|vp9|h264|ffv1|ffv1l3] [-n] [-v] infile outfile
-#     defaults: fps=1 w=320 h=240 codec=png; the container is chosen from the
-#     outfile extension (.mkv .nut .avi .mp4 .mov .webm).
-#     -n  no gzip (for already-compressed/noisy data)   -v  verbose
+#   binary2video [-f fps] [-w width] [-h height] [-c png|vp9|h264|ffv1|ffv1l3]
+#                [-m channels] [-t tracks] [-n] [-v] infile outfile
+#   defaults: fps=1 w=320 h=240 codec=png m=1 t=1; container from extension.
+#   -n  no gzip (for already-compressed/noisy data)   -v  verbose
 
 import argparse
 import hashlib
-import math
 import os
 import shutil
 import subprocess
@@ -47,9 +49,9 @@ import tempfile
 import zlib
 from fractions import Fraction
 
-HDR_LEN = 50                 # 4 magic + 1 flag + 15 + 15 + 15 digits
-MAGIC = b"B2V2"
-SAMPRATE = 48000             # Hz, mono
+HDR_LEN = 54                 # 4 magic + 1 flag + 15+15+15 digits + 2+2
+MAGIC = b"B2V3"
+SAMPRATE = 48000             # Hz per track
 BYTES_PER_SAMPLE = 2         # s16le
 
 VIDEO_CODECS = {
@@ -82,6 +84,7 @@ def run_or_die(cmd, what):
     if proc.returncode != 0:
         lines = proc.stderr.decode(errors="replace").strip().splitlines()
         fail(f"while {what}: {lines[-1] if lines else '(no stderr)'}", 7)
+    return proc.stdout
 
 
 def gzip_bytes(data, level=1):
@@ -90,21 +93,21 @@ def gzip_bytes(data, level=1):
     return z.compress(data) + z.flush()
 
 
-def choose_split(stream_len, fps, blocksize):
+def choose_split(stream_len, fps, blocksize, aud_bps, grain):
     """Return (frames, video_bytes, audio_bytes), balancing playing time.
 
-    The 50-byte header sits at the front of the video track; the stream is
-    then shared so video seconds == audio seconds where possible:
+    The 54-byte header sits at the front of the video track; the rest of the
+    stream is shared between the tracks s.t. video seconds ~= audio seconds:
 
-        video capacity/s = fps*blocksize bytes   audio capacity/s = SAMPRATE*2 bytes
-        ideal duration d solves d*fps*blocksize + d*SAMPRATE*2 = stream_len + HDR_LEN
+        video cap/s = fps*blocksize    audio cap/s = aud_bps (t x m x 96,000)
+        ideal duration d solves d*fps*blocksize + d*aud_bps = stream_len + HDR_LEN
+    `grain` is the audio granularity (2 bytes per channel per sample).
     """
     if blocksize <= HDR_LEN:
-        fail("pixels per frame too small to hold the 50-byte header; raise -w/-h", 6)
-    aud_bps = SAMPRATE * BYTES_PER_SAMPLE          # audio bytes per second
-    total_rate = fps * blocksize + aud_bps         # bytes per second, both tracks
+        fail("pixels per frame too small to hold the 54-byte header; raise -w/-h", 6)
+    total_rate = fps * blocksize + aud_bps
     ideal_secs = Fraction(stream_len + HDR_LEN, 1) / total_rate
-    base = int(ideal_secs * fps)               # ideal frame count (may under/overshoot by 1)
+    base = int(ideal_secs * fps)               # ideal frame count (may be off by 1)
     fps_inv = Fraction(1, 1) / fps
     best = None
     for frames in range(max(1, base - 2), base + 3):
@@ -112,17 +115,34 @@ def choose_split(stream_len, fps, blocksize):
         a = stream_len - v_capacity
         if a < 0:
             a = 0                              # everything fits into the video track
-        if a % 2:                              # audio comes in 2-byte samples
-            a += 1                             # one odd byte slides into the video part
+        if aud_bps == 0:
+            a = 0                              # container has no audio: all video
+        elif a % grain:                        # audio moves in whole sample frames
+            a += grain - a % grain             # the odd tail slides into video
         v = stream_len - a
         if v < 0 or v > v_capacity:
             continue
-        dur = max(Fraction(frames, 1) * fps_inv, Fraction(a, 1) / aud_bps)
+        aud_dur = Fraction(a, 1) / aud_bps if aud_bps else Fraction(0)
+        dur = max(Fraction(frames, 1) * fps_inv, aud_dur)
         if best is None or dur < best[0]:
             best = (dur, frames, v, a)
     if best is None:
         fail("no valid split found; try different -w/-h", 6)
-    return best[1], best[2], best[3]
+    return best[1], best[2], best[3]           # frames, v_bytes, a_bytes
+
+
+def split_audio(audio, channels, tracks):
+    """Cut `audio` into `tracks` whole-sample-frame chunks (concat = original)."""
+    grain = channels * BYTES_PER_SAMPLE
+    frames_total = len(audio) // grain
+    base, rem = divmod(frames_total, tracks)
+    chunks, pos = [], 0
+    for i in range(tracks):
+        n = base + (1 if i < rem else 0)
+        chunks.append(audio[pos:pos + n * grain])
+        pos += n * grain
+    assert pos == len(audio) and all(len(c) % grain == 0 for c in chunks)
+    return chunks
 
 
 def main():
@@ -141,6 +161,8 @@ def main():
     p.add_argument("-w", "--width", type=int, default=320)
     p.add_argument("-h", "--height", type=int, default=240)
     p.add_argument("-c", "--codec", default="png", choices=sorted(VIDEO_CODECS))
+    p.add_argument("-m", "--channels", type=int, default=1, help="audio channels 1..8 (6 = 5.1)")
+    p.add_argument("-t", "--tracks", type=int, default=1, help="audio tracks 1..8")
     p.add_argument("-n", "--no-gzip", action="store_true", help="do not gzip the stream")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("infile")
@@ -155,13 +177,17 @@ def main():
         fail("-f must be a positive number like 30, 29.97 or 30000/1001", 3)
     if args.width < 1 or args.height < 1:
         fail("-w and -h must be >= 1", 3)
+    if not 1 <= args.channels <= 8 or not 1 <= args.tracks <= 8:
+        fail("-m/-t must be between 1 and 8", 3)
 
     ext = os.path.splitext(args.outfile)[1].lower().lstrip(".")
     if ext not in CONTAINERS:
         fail("outfile must end in .mkv .nut .avi .mp4 .mov or .webm", 5)
     allowed_codecs, audio_codec = CONTAINERS[ext]
     if args.codec not in allowed_codecs:
-        fail(f"codec {args.codec} not allowed in .{ext} (allowed here: {', '.join(sorted(allowed_codecs))})", 5)
+        fail(f"codec {args.codec} not allowed in .{ext} (allowed: {', '.join(sorted(allowed_codecs))})", 5)
+    if audio_codec is None and (args.channels > 1 or args.tracks > 1):
+        fail(".webm keeps single vp9 video and no audio payload; drop -m/-t or pick .mkv", 5)
     if not os.access(args.infile, os.R_OK):
         fail(f"'{args.infile}' does not exist or is not readable", 4)
 
@@ -177,14 +203,22 @@ def main():
     stream_len = len(stream)
     blocksize = args.width * args.height * 3
 
-    frames, v_bytes, a_bytes = choose_split(stream_len, fps, blocksize)
+    use_audio = audio_codec is not None
+    tracks = args.tracks if use_audio else 1
+    channels = args.channels if use_audio else 1
+    aud_bps = tracks * channels * SAMPRATE * BYTES_PER_SAMPLE if use_audio else 0
+    grain = channels * BYTES_PER_SAMPLE if use_audio else 0
+
+    frames, v_bytes, a_bytes = choose_split(stream_len, fps, blocksize, aud_bps, grain)
     header = (MAGIC + flag.encode() +
               str(orig_len).zfill(15).encode() +
               str(v_bytes).zfill(15).encode() +
-              str(a_bytes).zfill(15).encode())
+              str(a_bytes).zfill(15).encode() +
+              str(channels).zfill(2).encode() +
+              str(tracks).zfill(2).encode())
     assert len(header) == HDR_LEN and v_bytes + a_bytes == stream_len
 
-    # 2) raw feeds: video payload (+header, +zero padding to whole frames)
+    # 2) raw feeds
     work = tempfile.mkdtemp(prefix="b2v.")
     try:
         video_raw = header + stream[:v_bytes]
@@ -197,19 +231,25 @@ def main():
                "-video_size", f"{args.width}x{args.height}",
                "-framerate", args.fps,
                "-i", os.path.join(work, "v.raw")]
+        maps = ["-map", "0:v"]
         if a_bytes > 0:
-            with open(os.path.join(work, "a.raw"), "wb") as fh:
-                fh.write(stream[v_bytes:])
-            cmd += ["-f", "s16le", "-ar", str(SAMPRATE), "-ac", "1",
-                    "-i", os.path.join(work, "a.raw"),
-                    "-c:a", audio_codec]
-        cmd += VIDEO_CODECS[args.codec] + [args.outfile]
+            chunks = split_audio(stream[v_bytes:], channels, tracks)
+            for i, chunk in enumerate(chunks, start=1):
+                path = os.path.join(work, f"a{i}.raw")
+                with open(path, "wb") as fh:
+                    fh.write(chunk)
+                cmd += ["-f", "s16le", "-ar", str(SAMPRATE), "-ac", str(channels), "-i", path]
+                maps += ["-map", f"{i}:a"]
+            cmd += ["-c:a", audio_codec]
+        cmd += maps + VIDEO_CODECS[args.codec] + [args.outfile]
         run_or_die(cmd, "encoding")
 
         if args.verbose:
-            dur = max(Fraction(frames, 1) / fps, Fraction(a_bytes, 1) / (SAMPRATE * BYTES_PER_SAMPLE))
+            dur = max(Fraction(frames, 1) / fps, Fraction(a_bytes, 1) / aud_bps if aud_bps else Fraction(0))
+            aud_line = f"audio={a_bytes} ({tracks} track x {channels} ch = {float(aud_bps):.0f} B/s)" \
+                if a_bytes > 0 else ("audio=none (container)" if aud_bps == 0 else "audio=none")
             print(f"codec={args.codec} container={ext} frames={frames} fps={fps}")
-            print(f"bytes/frame: {blocksize}   split: video={v_bytes} audio={a_bytes}")
+            print(f"bytes/frame: {blocksize}   split: video={v_bytes} {aud_line}")
             print(f"duration: {float(dur):.3f}s   output size: {os.path.getsize(args.outfile)}")
             print("header:", header.decode())
             print("input MD5 :", hashlib.md5(data).hexdigest())

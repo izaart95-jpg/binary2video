@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-# video2binary (v3, python) -- decode a video made by binary2video back
+# video2binary (v4, python) -- decode a video made by binary2video back
 # into the exact original binary file.
 #
 # Steps:
-#   1. ffprobe the file: does it have a video stream (+ optional audio)?
-#   2. decode video stream to raw RGB-24 bytes  (payload part 1)
-#   3. decode audio stream to raw s16le bytes   (payload part 2, if any)
-#   4. read the 50-byte ASCII header:
-#        "B2V2" + flag + orig_len(15) + video_bytes(15) + audio_bytes(15)
-#      stream = video_bytes[50..] + audio_bytes[:audio_bytes]
+#   1. ffprobe the file: does it have a video stream (+ how many audio)?
+#   2. decode video stream to raw RGB-24 bytes       (payload part 1)
+#   3. decode every audio track to raw s16le bytes   (payload part 2)
+#   4. read the 54-byte ASCII header:
+#        "B2V3" + flag + orig_len(15) + video_bytes(15) + audio_bytes(15)
+#              + channels(2) + tracks(2)
+#      stream = video_bytes[54..] + concat of the tracks[:audio_bytes]
 #      flag 'z' -> gunzip stream, must yield orig_len bytes
 #      flag 'r' -> truncate stream to orig_len
 #   5. fall back automatically for older formats:
-#        'B2V1' + flag + orig_len(15) + stream_len(15)  (video only, 35 bytes)
+#        'B2V2' + flag + orig_len(15) + video(15) + audio(15)   (mono, 1 track)
+#        'B2V1' + flag + orig_len(15) + stream_len(15)         (video only)
 #        no header at all = the original gzip+pad format: gunzip everything
 #
 # Usage: video2binary [-v] infile outfile
@@ -24,11 +26,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zlib
 
-HDR_LEN = 50
-MAGIC_V2 = b"B2V2"
-HDR_V1B = 35
-MAGIC_V1B = b"B2V1"
+MAGIC_V3 = b"B2V3"; HDR_V3 = 54
+MAGIC_V2 = b"B2V2"; HDR_V2 = 50
+MAGIC_V1B = b"B2V1";  HDR_V1B = 35
 
 
 def fail(msg, code):
@@ -46,7 +48,6 @@ def run_or_die(cmd, what):
 
 def gzip_decompress(raw):
     """Tolerant gunzip: accepts trailing zero padding / garbage after the stream."""
-    import zlib
     z = zlib.decompressobj(31)              # wbits=31 -> gzip format
     return z.decompress(raw) + z.flush()
 
@@ -75,9 +76,9 @@ def main():
         [ffprobe, "-v", "error", "-show_entries", "stream=codec_type",
          "-of", "default=nw=1:nk=1", args.infile], "probing video").decode()
     kinds = [line.split("=")[-1].strip() for line in probes.splitlines() if line.strip()]
+    audio_streams = sum(1 for k in kinds if k == "audio")
     if "video" not in kinds:
-        fail("mrs: no video stream found -- is this a binary2video output?", 8)
-    has_audio = "audio" in kinds
+        fail("no video stream found -- is this a binary2video output?", 8)
 
     work = tempfile.mkdtemp(prefix="v2b.")
     try:
@@ -86,28 +87,45 @@ def main():
                     os.path.join(work, "v.raw")], "decoding video")
         with open(os.path.join(work, "v.raw"), "rb") as fh:
             v_raw = fh.read()
-        a_raw = b""
-        if has_audio:
-            run_or_die([ffmpeg, "-y", "-loglevel", "error", "-i", args.infile,
-                        "-vn", "-f", "s16le", os.path.join(work, "a.raw")], "decoding audio")
-            with open(os.path.join(work, "a.raw"), "rb") as fh:
-                a_raw = fh.read()
 
         #----- read header / payload -----------------------------------
-        if v_raw[:4] == MAGIC_V2 and len(v_raw) >= HDR_LEN:
+        if v_raw[:4] in (MAGIC_V3, MAGIC_V2):
+            version = v_raw[:4].decode()
+            hdr_len = HDR_V3 if version == "B2V3" else HDR_V2
             flag = v_raw[4:5]
             orig_len = int(v_raw[5:20])
             v_bytes = int(v_raw[20:35])
             a_bytes = int(v_raw[35:50])
+            if version == "B2V3":
+                channels = int(v_raw[50:52])
+                tracks = int(v_raw[52:54])
+            else:
+                channels, tracks = 1, 1
             if flag not in (b"r", b"z"):
-                fail(f"corrupt B2V2 header: unknown flag {flag!r}", 6)
-            if flag == b"r" and v_bytes + a_bytes != orig_len:
-                fail("corrupt B2V2 header: raw sizes do not add up", 6)
-            if len(v_raw) < HDR_LEN + v_bytes:
-                fail("video claims fewer video bytes than header expects (truncated video?)", 8)
+                fail(f"corrupt {version} header: unknown flag {flag!r}", 6)
+            if not 1 <= channels <= 8 or not 1 <= tracks <= 8:
+                fail(f"corrupt {version} header: bad channels/tracks", 6)
+            if a_bytes > 0:
+                if audio_streams < tracks:
+                    fail(f"{version} header says {tracks} audio tracks, "
+                         f"file has {audio_streams} (truncated or foreign file?)", 8)
+                a_raw = b""
+                for i in range(tracks):
+                    run_or_die([ffmpeg, "-y", "-loglevel", "error", "-i", args.infile,
+                                "-vn", "-map", f"0:a:{i}", "-f", "s16le",
+                                os.path.join(work, f"a{i}.raw")], f"decoding audio track {i}")
+                    with open(os.path.join(work, f"a{i}.raw"), "rb") as fh:
+                        a_raw += fh.read()
+            else:
+                a_raw = b""
+                tracks = 1  # nothing stored in audio; header fields may be bogus
+            if len(v_raw) < hdr_len + v_bytes:
+                fail("video track shorter than header expects (truncated video?)", 8)
             if len(a_raw) < a_bytes:
-                fail("audio track shorter than header expects (truncated video?)", 8)
-            stream = v_raw[HDR_LEN:HDR_LEN + v_bytes] + a_raw[:a_bytes]
+                fail("audio tracks shorter than header expects (truncated video?)", 8)
+            stream = v_raw[hdr_len:hdr_len + v_bytes] + a_raw[:a_bytes]
+            if flag == b"r" and len(stream) != orig_len:
+                fail(f"payload is {len(stream)} bytes but header claims {orig_len}; corrupt header", 8)
             if flag == b"z":
                 out = gzip_decompress(stream)
                 if len(out) != orig_len:
@@ -115,8 +133,9 @@ def main():
             else:
                 out = stream[:orig_len]
             if args.verbose:
-                print(f"B2V2 header ok: flag={flag.decode()} orig_len={orig_len} "
-                      f"video_bytes={v_bytes} audio_bytes={a_bytes}")
+                print(f"{version} header ok: flag={flag.decode()} orig_len={orig_len} "
+                      f"video_bytes={v_bytes} audio_bytes={a_bytes} "
+                      f"ch={channels} tracks={tracks} (file has {audio_streams})")
         elif v_raw[:4] == MAGIC_V1B and len(v_raw) >= HDR_V1B:
             flag = v_raw[4:5]
             orig_len = int(v_raw[5:20])
@@ -124,6 +143,8 @@ def main():
             if len(v_raw) < HDR_V1B + stream_len:
                 fail("v1 video shorter than header expects (truncated?)", 8)
             stream = v_raw[HDR_V1B:HDR_V1B + stream_len]
+            if flag == b"r" and stream_len != orig_len:
+                fail(f"payload is {stream_len} bytes but header claims {orig_len}; corrupt header", 8)
             if flag == b"z":
                 out = gzip_decompress(stream)
                 if len(out) != orig_len:
