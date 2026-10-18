@@ -35,9 +35,18 @@
 #
 # Usage:
 #   binary2video [-f fps] [-w width] [-h height] [-c png|vp9|h264|ffv1|ffv1l3]
-#                [-m channels] [-t tracks] [-n] [-v] infile outfile
+#                [-m channels] [-t tracks] [-n] [-v] [-y] [--levels 2|4|8]
+#                infile outfile
 #   defaults: fps=1 w=320 h=240 codec=png m=1 t=1; container from extension.
 #   -n  no gzip (for already-compressed/noisy data)   -v  verbose
+#
+#   -y  PLATFORM MODE (format B2V4, needs b2v_rs.py next to this script):
+#       survives lossy re-encoding by YouTube-messengers-editors. The payload
+#       rides in gray-cell plates + Reed-Solomon inside a normal yuv420p
+#       H.264 .mp4/.mov. Costs ~99% of density vs B2V3: kilobytes per
+#       minute at 320x240, not megabytes. Use when the video will travel
+#       through a transcoding platform; otherwise don't.
+#       --levels 2|4|8: amplitude per cell (2 = max robustness, 8 = denser).
 
 import argparse
 import hashlib
@@ -53,6 +62,142 @@ HDR_LEN = 54                 # 4 magic + 1 flag + 15+15+15 digits + 2+2
 MAGIC = b"B2V3"
 SAMPRATE = 48000             # Hz per track
 BYTES_PER_SAMPLE = 2         # s16le
+
+#--- platform mode (-y, format B2V4) -----------------------------------------
+# Payload painted as large flat GRAY cell plates (R=G=B -> immune to chroma
+# subsampling and every RGB<->YUV matrix), read back against a per-frame
+# calibration ramp (immune to any monotonic brightness shift: gamma, range
+# conversions, codec qp drift), protected with Reed-Solomon over the whole
+# stream. The carrier is a plain yuv420p H.264 mp4 -- the least destructive
+# thing to feed YouTube & friends.
+YT_CELL = 10                 # pixels per plate cell
+YT_PARITY = 64               # RS parity bytes per block -> fixes 32 errors
+YT_K = 159                   # data bytes per full block
+YT_META = 35                 # magic4 + flag1 + orig_len15 + stream_len15
+YT_LEVELS = {2: (40, 220),
+             4: (40, 100, 160, 220),
+             8: (40, 66, 91, 117, 143, 169, 194, 220)}
+
+
+def b2v4_plate(frame_syms, frame_index, cols, rows, W, H, levels):
+    """Paint one W x H plate: row0 = calibration ramp, row1 = frame index,
+    body rows = payload symbols."""
+    img = bytearray(bytes([levels[0]]) * (W * H * 3))
+
+    def paint(cx, cy, v):
+        for y in range(cy * YT_CELL, (cy + 1) * YT_CELL):
+            base = (y * W + cx * YT_CELL) * 3
+            for _ in range(YT_CELL):
+                img[base] = img[base + 1] = img[base + 2] = v
+                base += 3
+
+    for c in range(cols):                                # calibration ramp
+        paint(c, 0, levels[c] if c < len(levels) else levels[0])
+    # frame index in base-M, 8 cells, big-endian -> products survive re-timing
+    idx = frame_index
+    digs = []
+    for _ in range(8):
+        digs.append(idx % len(levels))
+        idx //= len(levels)
+    for c in range(cols):
+        paint(c, 1, levels[digs[7 - c]] if c < 8 else levels[0])
+    j = 0
+    for r in range(2, rows):                             # body raster
+        for c in range(cols):
+            if j < len(frame_syms):
+                paint(c, r, levels[frame_syms[j]])
+                j += 1
+    return bytes(img)
+
+
+def bits_to_symbols(data_bytes, bps):
+    """Byte stream -> bps-bit symbols (MSB-first; final symbol zero-padded)."""
+    syms = []
+    acc = n = 0
+    for byte in data_bytes:
+        for i in range(7, -1, -1):
+            acc = (acc << 1) | ((byte >> i) & 1)
+            n += 1
+            if n == bps:
+                syms.append(acc)
+                acc = n = 0
+    if n:
+        syms.append(acc << (bps - n))
+    return syms
+
+
+def platform_pack(args, fps, data):
+    """-y mode: build the RS-protected B2V4 stream and encode the carrier."""
+    ext = os.path.splitext(args.outfile)[1].lower().lstrip(".")
+    if ext not in ("mp4", "mov"):
+        fail("-y needs a .mp4 (or .mov) carrier; that is what platforms take", 5)
+    if (args.width // YT_CELL) < 9 or (args.height // YT_CELL) < 2:
+        fail("-y needs at least 90x20 of plate; use the 320x240 default", 3)
+    b2v_rs = load_rs()
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        fail("ffmpeg not found", 2)
+
+    W, H = args.width, args.height
+    cols, rows = W // YT_CELL, H // YT_CELL
+    levels = YT_LEVELS[args.levels]
+    M = len(levels)
+    bps = M.bit_length() - 1
+
+    orig_len = len(data)
+    flag = "r" if args.no_gzip else "z"
+    stream = data if flag == "r" else gzip_bytes(data)
+    meta = (b"B2V4" + flag.encode() +
+            str(orig_len).zfill(15).encode() +
+            str(len(stream)).zfill(15).encode())
+    data_all = meta + stream                              # protects meta too
+    if len(data_all) % YT_K:                              # full-K blocks only:
+        data_all += bytes(-len(data_all) % YT_K)          # uniform 159+64 wire
+    chunks = [data_all[i:i + YT_K] for i in range(0, len(data_all), YT_K)]
+    cw = b"".join(b2v_rs.rs_encode(c, YT_PARITY) for c in chunks)
+    syms = bits_to_symbols(cw, bps)
+
+    cells = (rows - 2) * cols                             # body cells/frame
+    n_frames = max(1, -(-len(syms) // cells))
+    os.makedirs(os.path.dirname(os.path.abspath(args.outfile)), exist_ok=True)
+
+    proc = subprocess.Popen(
+        [ffmpeg, "-y", "-loglevel", "error",
+         "-f", "rawvideo", "-pixel_format", "rgb24",
+         "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "pipe:0",
+         "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=48000",
+         "-map", "0:v", "-map", "1:a", "-shortest",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+         "-profile:v", "main", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart",
+         args.outfile],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    pos = 0
+    try:
+        for f in range(n_frames):
+            chunk = syms[pos:pos + cells]
+            pos += cells
+            if len(chunk) < cells:
+                chunk += [0] * (cells - len(chunk))
+            proc.stdin.write(b2v4_plate(chunk, f, cols, rows, W, H, levels))
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    err = proc.stderr.read().decode(errors="replace").strip()
+    if proc.wait() != 0:
+        fail(f"while encoding carrier: {err.splitlines()[-1] if err else '?'}", 7)
+
+    if args.verbose:
+        rate = len(levels) / (YT_CELL * YT_CELL)          # data bit/px*...
+        print(f"mode=-y (B2V4) plate={W}x{H} cell={YT_CELL}px "
+              f"levels={M} ({bps} bit/cell)")
+        print(f"rs: k={YT_K} parity={YT_PARITY} blocks={len(chunks)} "
+              f"-> fixes <= {YT_PARITY // 2} bad bytes/block")
+        print(f"frames={n_frames} fps={fps} cells/frame={cells} "
+              f"payload bits/frame={cells * bps}")
+        print(f"stream={len(stream)} B over {len(cw)} protected B; "
+              f"video={os.path.getsize(args.outfile)} B")
+        print("header:", meta.decode())
 
 VIDEO_CODECS = {
     "png":    ["-c:v", "png", "-compression_level", "9"],
@@ -85,6 +230,16 @@ def run_or_die(cmd, what):
         lines = proc.stderr.decode(errors="replace").strip().splitlines()
         fail(f"while {what}: {lines[-1] if lines else '(no stderr)'}", 7)
     return proc.stdout
+
+
+def load_rs():
+    """Import b2v_rs.py from this script's directory (keeps -y self-locating)."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import b2v_rs
+        return b2v_rs
+    except ImportError:
+        fail("b2v_rs.py is missing next to this script", 2)
 
 
 def gzip_bytes(data, level=1):
@@ -165,6 +320,10 @@ def main():
     p.add_argument("-t", "--tracks", type=int, default=1, help="audio tracks 1..8")
     p.add_argument("-n", "--no-gzip", action="store_true", help="do not gzip the stream")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-y", "--survive", action="store_true",
+                   help="platform-hardened B2V4 plates (survives YouTube-style re-encode)")
+    p.add_argument("--levels", type=int, default=4, choices=[2, 4, 8],
+                   help="gray levels per plate cell in -y mode (robustness/density)")
     p.add_argument("infile")
     p.add_argument("outfile")
     args = p.parse_args()
@@ -190,6 +349,11 @@ def main():
         fail(".webm keeps single vp9 video and no audio payload; drop -m/-t or pick .mkv", 5)
     if not os.access(args.infile, os.R_OK):
         fail(f"'{args.infile}' does not exist or is not readable", 4)
+    if args.survive:
+        if "-c" in sys.argv or "--codec" in sys.argv:
+            fail("-y picks its own lossy-tolerant carrier; drop -c", 3)
+        if any(a in sys.argv for a in ("-m", "--channels", "-t", "--tracks")):
+            fail("in -y mode the payload rides in video plates only; drop -m/-t", 3)
 
     outdir = os.path.dirname(os.path.abspath(args.outfile))
     os.makedirs(outdir, exist_ok=True)
@@ -197,6 +361,9 @@ def main():
     # 1) stored stream + header
     with open(args.infile, "rb") as fh:
         data = fh.read()
+    if args.survive:
+        platform_pack(args, fps, data)
+        return
     orig_len = len(data)
     flag = "r" if args.no_gzip else "z"
     stream = data if flag == "r" else gzip_bytes(data)

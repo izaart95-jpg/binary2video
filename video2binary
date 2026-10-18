@@ -17,6 +17,10 @@
 #        'B2V1' + flag + orig_len(15) + stream_len(15)         (video only)
 #        no header at all = the original gzip+pad format: gunzip everything
 #
+# B2V4 "plates" are auto-detected (no flags): gray cell grids carrying a
+# Reed-Solomon protected stream (made by binary2video -y). They survive
+# lossy platform re-encoding; needs b2v_rs.py next to this script.
+#
 # Usage: video2binary [-v] infile outfile
 
 import argparse
@@ -31,6 +35,187 @@ import zlib
 MAGIC_V3 = b"B2V3"; HDR_V3 = 54
 MAGIC_V2 = b"B2V2"; HDR_V2 = 50
 MAGIC_V1B = b"B2V1";  HDR_V1B = 35
+
+#--- platform mode (B2V4 plates; auto-detected, no flags needed) -----------
+YT_CELL = 10
+YT_PARITY = 64
+YT_K = 159
+YT_META = 35
+YT_LEVELS = {2: (40, 220),
+             4: (40, 100, 160, 220),
+             8: (40, 66, 91, 117, 143, 169, 194, 220)}
+
+
+def load_rs():
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import b2v_rs
+        return b2v_rs
+    except ImportError:
+        fail("b2v_rs.py is missing next to this script (needed for B2V4 plates)", 2)
+
+
+def _cell_gray(img, W, cy, cx):
+    """Mean gray of a cell's inner area (2px inset kills boundary ringing)."""
+    s = n = 0
+    for y in range(cy * YT_CELL + 2, (cy + 1) * YT_CELL - 2):
+        base = (y * W + cx * YT_CELL + 2) * 3
+        for _ in range(YT_CELL - 4):
+            s += img[base] + img[base + 1] + img[base + 2]
+            base += 3
+    return s / (3.0 * (YT_CELL - 4) ** 2)
+
+
+def _ramp_ok(vals, M):
+    """Calibration ramp sanity for one frame (used to reject blended frames)."""
+    ramp = vals[:M]
+    if not all(ramp[i + 1] - ramp[i] >= 8 for i in range(M - 1)):
+        return False
+    if ramp[-1] - ramp[0] < 70:
+        return False
+    if abs(vals[M] - ramp[0]) > 10:
+        return False
+    return True
+
+
+def detect_b2v4(v_raw, W, H, n_frames):
+    """Scan frames for the ramp signature. Returns (M, start_frame) or None."""
+    if W % YT_CELL or H % YT_CELL:
+        return None
+    cols, rows = W // YT_CELL, H // YT_CELL
+    if n_frames < 1 or cols < 9 or rows < 3:
+        return None
+    for M in (8, 4, 2):
+        for f in range(n_frames):
+            img = v_raw[f * W * H * 3:(f + 1) * W * H * 3]
+            vals = [_cell_gray(img, W, 0, c) for c in range(M + 1)]
+            if _ramp_ok(vals, M):
+                return M, f
+    return None
+
+
+def demod_b2v4(v_raw, W, H, M, start_frame):
+    """Frame-index-aware demod: (index -> symbols), order/dup/garbage-tolerant.
+
+    Returns (bytes, stats): the whole protected stream as bytes plus a
+    statistics dict about what the platform did to the frames.
+    """
+    bps = M.bit_length() - 1
+    cols, rows = W // YT_CELL, H // YT_CELL
+    fsize = W * H * 3
+    n_frames = len(v_raw) // fsize
+    sections = {}
+    stats = {"kept": 0, "dups": 0, "skipped": 0, "conflicts": 0}
+    for f in range(start_frame, n_frames):
+        img = v_raw[f * fsize:(f + 1) * fsize]
+        vals = [_cell_gray(img, W, 0, c) for c in range(M + 1)]
+        if not _ramp_ok(vals, M):
+            stats["skipped"] += 1
+            continue
+        idx = 0
+        for c in range(8):
+            g = _cell_gray(img, W, 1, c)
+            idx = idx * M + min(range(M), key=lambda j: abs(g - vals[j]))
+        if idx >= M ** 8:
+            stats["skipped"] += 1
+            continue
+        vec = []
+        for r in range(2, rows):
+            for c in range(cols):
+                g = _cell_gray(img, W, r, c)
+                vec.append(min(range(M), key=lambda j: abs(g - vals[j])))
+        if idx in sections:
+            if sections[idx] == vec:
+                stats["dups"] += 1
+                continue
+            stats["conflicts"] += 1          # keep the first seen copy
+            continue
+        sections[idx] = vec
+        stats["kept"] += 1
+    if not sections:
+        fail("B2V4 plate found but no frame had a readable index", 9)
+    keys = sorted(sections)
+    if keys != list(range(keys[-1] + 1)):
+        fail(f"B2V4 plate has gaps in its frame sequence: got indices "
+             f"{keys}; a payload frame was lost or mangled beyond the "
+             f"transcode channel", 9)
+    bits = []
+    for idx in keys:
+        for sym in sections[idx]:
+            for k in range(bps - 1, -1, -1):
+                bits.append((sym >> k) & 1)
+    out = bytearray()
+    for i in range(0, len(bits) - 7, 8):
+        out.append(sum(bits[i + j] << (7 - j) for j in range(8)))
+    stats["cells_frame"] = (rows - 2) * cols
+    return bytes(out), stats
+
+
+def try_b2v4(v_raw, W, H, args):
+    """Decode a B2V4 plate file. None = not a plate; str/bytes = payload."""
+    fsize = W * H * 3
+    if len(v_raw) % fsize != 0:
+        return None
+    det = detect_b2v4(v_raw, W, H, len(v_raw) // fsize)
+    if det is None:
+        return None
+    M, start = det
+    b2v_rs = load_rs()
+
+    blob, stats = demod_b2v4(v_raw, W, H, M, start)
+    if len(blob) < YT_K + YT_PARITY:
+        fail(f"B2V4 plate detected but only {len(blob)} B came out of the "
+             f"grid: video too short or resized", 9)
+    try:
+        data, fixed0 = b2v_rs.rs_repair(blob[:YT_K + YT_PARITY], YT_K)
+    except b2v_rs.RSUnfixable:
+        fail("B2V4 plate detected but the protected header did not repair: "
+             "the platform re-encoded, resized or cropped the video harder "
+             "than the Reed-Solomon budget allows", 9)
+    if data[:4] != b"B2V4":
+        fail("B2V4 plate detected but its header is not intact", 9)
+    flag = data[4:5]
+    orig_len = int(data[5:20])
+    stream_len = int(data[20:35])
+    if flag not in (b"r", b"z"):
+        fail("B2V4 header flag is not r/z (corrupt after repair?)", 8)
+
+    total = YT_META + stream_len
+    n_blocks = max(1, -(-total // YT_K))
+    chunks = [data]
+    fixed_total = fixed0
+    pos = YT_K + YT_PARITY
+    for i in range(1, n_blocks):
+        need = YT_K + YT_PARITY                           # uniform 223 on wire
+        if pos + need > len(blob):
+            fail("B2V4 plate ends before its last block (truncated video?)", 9)
+        try:
+            block, nf = b2v_rs.rs_repair(blob[pos:pos + need], YT_K)
+        except b2v_rs.RSUnfixable:
+            fail(f"B2V4 block {i} exceeds the Reed-Solomon repair budget: "
+                 f"damage too heavy for this plate", 9)
+        chunks.append(block)
+        fixed_total += nf
+        pos += need
+    full = b"".join(chunks)
+    stream = full[YT_META:YT_META + stream_len]
+    if flag == b"z":
+        out = gunzip_or_die(stream)
+        if len(out) != orig_len:
+            fail(f"gunzip yielded {len(out)} bytes, header says {orig_len}", 8)
+    else:
+        if len(stream) < orig_len:
+            fail(f"payload is {len(stream)} bytes but header claims {orig_len}", 8)
+        out = stream[:orig_len]
+
+    if args.verbose:
+        print(f"B2V4 plate: {M} levels, {n_blocks} RS block(s); frames kept "
+              f"{stats['kept']} (dup {stats['dups']}, garbled+skipped "
+              f"{stats['skipped']}, conflict {stats['conflicts']})")
+        print(f"RS repaired {fixed_total} damaged byte(s), budget "
+              f"{YT_PARITY // 2}/block")
+        print(f"flag={flag.decode()} orig_len={orig_len} stream={stream_len} B")
+    return out
 
 
 def fail(msg, code):
@@ -91,6 +276,16 @@ def main():
     if "video" not in kinds:
         fail("no video stream found -- is this a binary2video output?", 8)
 
+    dims = run_or_die([ffprobe, "-v", "error", "-select_streams", "v:0",
+                       "-show_entries", "stream=width,height",
+                       "-of", "csv=p=0", args.infile], "probing size").decode().strip()
+    try:
+        W, H = (int(v) for v in dims.splitlines()[0].split(","))
+    except ValueError:
+        fail(f"could not read video dimensions ({dims!r})", 8)
+    if W <= 0 or H <= 0:
+        fail(f"nonsense video dimensions ({W}x{H})", 8)
+
     work = tempfile.mkdtemp(prefix="v2b.")
     try:
         run_or_die([ffmpeg, "-y", "-loglevel", "error", "-i", args.infile,
@@ -98,6 +293,12 @@ def main():
                     os.path.join(work, "v.raw")], "decoding video")
         with open(os.path.join(work, "v.raw"), "rb") as fh:
             v_raw = fh.read()
+
+        plate_out = try_b2v4(v_raw, W, H, args)
+        if plate_out is not None:
+            with open(args.outfile, "wb") as fh:
+                fh.write(plate_out)
+            sys.exit(0)
 
         #----- read header / payload -----------------------------------
         if v_raw[:4] in (MAGIC_V3, MAGIC_V2):

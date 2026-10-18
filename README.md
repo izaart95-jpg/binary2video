@@ -82,6 +82,50 @@ The first bash prototype (h264 ultrafast qp0, video track only) stored the same 
 
 Honest caveat: this is storage, not steganography — play a packed file and you get RGB noise frames and loud static. It's a valid video any player will open, but anyone sniffing metadata will know it isn't a cat video.
 
+## 🛈 Modes
+
+Default mode: maximum density, bit-exact through any lossless carrier. If the
+video is only going to travel as a file — copy, chat attachment that you send
+as a document — this is the one to use.
+
+## 🛡️ YouTube-proof mode `-y` (format B2V4)
+
+When the video must go *through* a transcoding platform (YouTube, messengers,
+editors), byte-exact pixels die — measured on a real YouTube roundtrip: the
+platform re-encoded 4:4:4 → lossy 4:2:0, re-timed one frame into 18, and
+smudged the payload region, while every *flat* area came back bit-for-bit.
+`-y` stores data the way transcoders can't destroy:
+
+- payload bytes → **big flat gray cells** (R = G = B): survives chroma
+  subsampling and every RGB↔YUV matrix (gray is identical in all of them)
+- one **calibration ramp** row per frame → cells are classified by *nearest
+  ramp level*, so any monotonic brightness shift (gamma, range, codec qp)
+  cancels out
+- a **frame-index row** → duplicates dedupe, reorders self-heal, garbled
+  frames get skipped — because platforms re-time everything
+- the whole stream underneath **Reed–Solomon GF(256)** (159 data + 64 parity
+  per block = 32 corrupted bytes repairable per block), gzip still optional
+- carrier: plain H.264 yuv420p `.mp4`/`.mov` with a silent AAC track — the
+  least destructive thing you can feed a platform
+
+Verified against simulated platform transcodes: H.264 crf 23 and a bitrate-
+starved crf 33, VP9, AV1, 6 fps re-timing, and a 33→36-frame full shuffle
+with duplicate inserts — all bit-exact after decode.
+
+```sh
+./binary2video -y data.bin data.mp4                # the uploadable one
+./binary2video -y -f 30 data.bin data.mp4          # ~3.7 kB/s instead of 125 B/s
+./binary2video -y --levels 8 data.bin data.mp4     # denser, tighter margins
+video2binary data.mp4 data.out                     # same tool, auto-detected
+```
+
+The price is honest: ~125 bytes of payload per 320x240 frame (after RS), so
+kilobytes-per-minute territory — a 1 MiB file at 30 fps is ~4.7 min of video.
+`--levels 2` doubles the safety margin for flaky platforms.
+
+To verify with your own platform: pack, upload, redownload the best quality,
+then `./video2binary redownloaded.mp4 out.bin` — MD5 must match.
+
 ## 🔧 Ideas on the table
 
 - FLAC payload audio to give `.webm` a second slot (ffmpeg's webm muxer refuses flac today: "Only VP8 or VP9 or AV1 video and Vorbis or Opus audio")
