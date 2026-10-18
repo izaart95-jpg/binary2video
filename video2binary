@@ -52,6 +52,17 @@ def gzip_decompress(raw):
     return z.decompress(raw) + z.flush()
 
 
+def gunzip_or_die(raw):
+    """gunzip that turns corruption into an explanation instead of a traceback."""
+    try:
+        return gzip_decompress(raw)
+    except zlib.error:
+        fail("the pixels do not decode back into data: this video was re-encoded "
+             "somewhere along the way (YouTube, a chat app, an editor...) and "
+             "lossless payload data does not survive that. Extract from the file "
+             "binary2video produced, before any platform touched it.", 9)
+
+
 def main():
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
@@ -127,7 +138,7 @@ def main():
             if flag == b"r" and len(stream) != orig_len:
                 fail(f"payload is {len(stream)} bytes but header claims {orig_len}; corrupt header", 8)
             if flag == b"z":
-                out = gzip_decompress(stream)
+                out = gunzip_or_die(stream)
                 if len(out) != orig_len:
                     fail(f"gunzip yielded {len(out)} bytes, header says {orig_len}", 8)
             else:
@@ -146,7 +157,7 @@ def main():
             if flag == b"r" and stream_len != orig_len:
                 fail(f"payload is {stream_len} bytes but header claims {orig_len}; corrupt header", 8)
             if flag == b"z":
-                out = gzip_decompress(stream)
+                out = gunzip_or_die(stream)
                 if len(out) != orig_len:
                     fail(f"gunzip yielded {len(out)} bytes, header says {orig_len}", 8)
             else:
@@ -156,7 +167,7 @@ def main():
         else:
             if args.verbose:
                 print("no B2Vx header found -> legacy gzip+pad mode")
-            out = gzip_decompress(v_raw)
+            out = gunzip_or_die(v_raw)
 
         with open(args.outfile, "wb") as fh:
             fh.write(out)
