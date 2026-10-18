@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+# video2binary (v3, python) -- decode a video made by binary2video back
+# into the exact original binary file.
+#
+# Steps:
+#   1. ffprobe the file: does it have a video stream (+ optional audio)?
+#   2. decode video stream to raw RGB-24 bytes  (payload part 1)
+#   3. decode audio stream to raw s16le bytes   (payload part 2, if any)
+#   4. read the 50-byte ASCII header:
+#        "B2V2" + flag + orig_len(15) + video_bytes(15) + audio_bytes(15)
+#      stream = video_bytes[50..] + audio_bytes[:audio_bytes]
+#      flag 'z' -> gunzip stream, must yield orig_len bytes
+#      flag 'r' -> truncate stream to orig_len
+#   5. fall back automatically for older formats:
+#        'B2V1' + flag + orig_len(15) + stream_len(15)  (video only, 35 bytes)
+#        no header at all = the original gzip+pad format: gunzip everything
+#
+# Usage: video2binary [-v] infile outfile
+
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HDR_LEN = 50
+MAGIC_V2 = b"B2V2"
+HDR_V1B = 35
+MAGIC_V1B = b"B2V1"
+
+
+def fail(msg, code):
+    sys.stderr.write(f"error: {msg}\n")
+    sys.exit(code)
+
+
+def run_or_die(cmd, what):
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        lines = proc.stderr.decode(errors="replace").strip().splitlines()
+        fail(f"while {what}: {lines[-1] if lines else '(no stderr)'}", 7)
+    return proc.stdout
+
+
+def gzip_decompress(raw):
+    """Tolerant gunzip: accepts trailing zero padding / garbage after the stream."""
+    import zlib
+    z = zlib.decompressobj(31)              # wbits=31 -> gzip format
+    return z.decompress(raw) + z.flush()
+
+
+def main():
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        fail("ffmpeg/ffprobe not found", 2)
+
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("infile")
+    p.add_argument("outfile")
+    if len(sys.argv) == 1 or "--help" in sys.argv:
+        print(__doc__)
+        sys.exit(0 if "--help" in sys.argv else 2)
+    args = p.parse_args()
+
+    if not os.access(args.infile, os.R_OK):
+        fail(f"'{args.infile}' does not exist or is not readable", 4)
+    outdir = os.path.dirname(os.path.abspath(args.outfile))
+    os.makedirs(outdir, exist_ok=True)
+
+    probes = run_or_die(
+        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type",
+         "-of", "default=nw=1:nk=1", args.infile], "probing video").decode()
+    kinds = [line.split("=")[-1].strip() for line in probes.splitlines() if line.strip()]
+    if "video" not in kinds:
+        fail("mrs: no video stream found -- is this a binary2video output?", 8)
+    has_audio = "audio" in kinds
+
+    work = tempfile.mkdtemp(prefix="v2b.")
+    try:
+        run_or_die([ffmpeg, "-y", "-loglevel", "error", "-i", args.infile,
+                    "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    os.path.join(work, "v.raw")], "decoding video")
+        with open(os.path.join(work, "v.raw"), "rb") as fh:
+            v_raw = fh.read()
+        a_raw = b""
+        if has_audio:
+            run_or_die([ffmpeg, "-y", "-loglevel", "error", "-i", args.infile,
+                        "-vn", "-f", "s16le", os.path.join(work, "a.raw")], "decoding audio")
+            with open(os.path.join(work, "a.raw"), "rb") as fh:
+                a_raw = fh.read()
+
+        #----- read header / payload -----------------------------------
+        if v_raw[:4] == MAGIC_V2 and len(v_raw) >= HDR_LEN:
+            flag = v_raw[4:5]
+            orig_len = int(v_raw[5:20])
+            v_bytes = int(v_raw[20:35])
+            a_bytes = int(v_raw[35:50])
+            if flag not in (b"r", b"z"):
+                fail(f"corrupt B2V2 header: unknown flag {flag!r}", 6)
+            if flag == b"r" and v_bytes + a_bytes != orig_len:
+                fail("corrupt B2V2 header: raw sizes do not add up", 6)
+            if len(v_raw) < HDR_LEN + v_bytes:
+                fail("video claims fewer video bytes than header expects (truncated video?)", 8)
+            if len(a_raw) < a_bytes:
+                fail("audio track shorter than header expects (truncated video?)", 8)
+            stream = v_raw[HDR_LEN:HDR_LEN + v_bytes] + a_raw[:a_bytes]
+            if flag == b"z":
+                out = gzip_decompress(stream)
+                if len(out) != orig_len:
+                    fail(f"gunzip yielded {len(out)} bytes, header says {orig_len}", 8)
+            else:
+                out = stream[:orig_len]
+            if args.verbose:
+                print(f"B2V2 header ok: flag={flag.decode()} orig_len={orig_len} "
+                      f"video_bytes={v_bytes} audio_bytes={a_bytes}")
+        elif v_raw[:4] == MAGIC_V1B and len(v_raw) >= HDR_V1B:
+            flag = v_raw[4:5]
+            orig_len = int(v_raw[5:20])
+            stream_len = int(v_raw[20:35])
+            if len(v_raw) < HDR_V1B + stream_len:
+                fail("v1 video shorter than header expects (truncated?)", 8)
+            stream = v_raw[HDR_V1B:HDR_V1B + stream_len]
+            if flag == b"z":
+                out = gzip_decompress(stream)
+                if len(out) != orig_len:
+                    fail(f"gunzip yielded {len(out)} bytes, header says {orig_len}", 8)
+            else:
+                out = stream[:orig_len]
+            if args.verbose:
+                print(f"B2V1 header ok: flag={flag.decode()} orig_len={orig_len} stream_len={stream_len}")
+        else:
+            if args.verbose:
+                print("no B2Vx header found -> legacy gzip+pad mode")
+            out = gzip_decompress(v_raw)
+
+        with open(args.outfile, "wb") as fh:
+            fh.write(out)
+        if args.verbose:
+            print(f"output: {len(out)} bytes   MD5: {hashlib.md5(out).hexdigest()}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

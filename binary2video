@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# binary2video (v3, python) -- pack any binary file inside a VALID video
+# (and its audio track!) and recover it exactly with video2binary.
+#
+# Every payload byte is stored in raw RGB-24 pixels and raw signed 16-bit
+# PCM samples, coded with a LOSSLESS codec, so unpacking is bit-exact.
+#
+# PAYLOAD FORMAT (ASCII header inside the first video frame; the container
+# wraps it, so peek with:
+#   ffmpeg -i out.mkv -f rawvideo -pix_fmt rgb24 -  |  head -c 50 ):
+#   "B2V2" + flag + orig_len(15 digits) + video_bytes(15) + audio_bytes(15)
+#     flag 'r' = stream is raw data       'z' = stream is gzipped data
+#   The stored stream is split over both tracks:
+#     video raw: header(50) + stream[:video_bytes], zero-padded to whole frames
+#     audio raw: stream[video_bytes:], mono 48000 Hz s16le PCM
+#   Unpack = concatenate the two parts, then (z) gunzip / (r) truncate to orig_len.
+#   'B2V1' header = old video-only format (35 bytes), still unpackable. Videos
+#   with no header at all = the original gzip+pad format, still unpackable.
+#
+# WHY THE AUDIO TRACK HELPS: per second, the video track holds
+#   fps * width * height * 3  bytes, the audio adds  2 * 48000 = 96 kB/s.
+# The packer splits the stream between both tracks so that video and audio
+# play for the same time -> minimum duration, i.e. maximum bytes/second.
+# (Example: 320x240@1fps + audio: 230,400 B/s video vs 326,400 B/s combined.)
+#
+# CODEC GUIDE (1 MiB random data, 320x240, .mkv output):
+#   png  (default)  ~0.92 MiB  best density; Deflate passes noise ~1:1
+#   vp9             ~1.13 MiB  the only codec allowed in .webm
+#   ffv1 / ffv1l3   ~1.18 MiB  fastest; ffv1l3 = slice-parallel
+#   h264            ~1.55 MiB  most player-friendly (CABAC + qp 0)
+#   All verified bit-exact over full pack/unpack roundtrips.
+#
+# Usage:
+#   binary2video [-f fps] [-w width] [-h height] [-c png|vp9|h264|ffv1|ffv1l3] [-n] [-v] infile outfile
+#     defaults: fps=1 w=320 h=240 codec=png; the container is chosen from the
+#     outfile extension (.mkv .nut .avi .mp4 .mov .webm).
+#     -n  no gzip (for already-compressed/noisy data)   -v  verbose
+
+import argparse
+import hashlib
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import zlib
+from fractions import Fraction
+
+HDR_LEN = 50                 # 4 magic + 1 flag + 15 + 15 + 15 digits
+MAGIC = b"B2V2"
+SAMPRATE = 48000             # Hz, mono
+BYTES_PER_SAMPLE = 2         # s16le
+
+VIDEO_CODECS = {
+    "png":    ["-c:v", "png", "-compression_level", "9"],
+    "vp9":    ["-c:v", "libvpx-vp9", "-lossless", "1"],
+    "h264":   ["-c:v", "libx264rgb", "-preset", "ultrafast", "-qp", "0", "-coder", "1"],
+    "ffv1":   ["-c:v", "ffv1", "-level", "1", "-coder", "1", "-context", "0", "-g", "1"],
+    "ffv1l3": ["-c:v", "ffv1", "-level", "3", "-threads", "8", "-coder", "1", "-context", "1",
+               "-slices", "24", "-slicecrc", "1", "-g", "1"],
+}
+
+# container -> (allowed video codecs, allowed audio codec or None)
+CONTAINERS = {
+    "mkv":  ({"png", "vp9", "h264", "ffv1", "ffv1l3"}, "pcm_s16le"),
+    "nut":  ({"png", "vp9", "h264", "ffv1", "ffv1l3"}, "pcm_s16le"),
+    "mov":  ({"png", "h264"}, "pcm_s16le"),
+    "mp4":  ({"png", "h264"}, "pcm_s16le"),
+    "avi":  ({"png", "h264", "ffv1", "ffv1l3"}, "pcm_s16le"),
+    "webm": ({"vp9"}, None),   # webm allows only lossy audio (opus/vorbis) -> no audio
+}
+
+
+def fail(msg, code):
+    sys.stderr.write(f"error: {msg}\n")
+    sys.exit(code)
+
+
+def run_or_die(cmd, what):
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        lines = proc.stderr.decode(errors="replace").strip().splitlines()
+        fail(f"while {what}: {lines[-1] if lines else '(no stderr)'}", 7)
+
+
+def gzip_bytes(data, level=1):
+    """gzip-format stream (like `gzip --fast`) using only the stdlib."""
+    z = zlib.compressobj(level, zlib.DEFLATED, 31)
+    return z.compress(data) + z.flush()
+
+
+def choose_split(stream_len, fps, blocksize):
+    """Return (frames, video_bytes, audio_bytes), balancing playing time.
+
+    The 50-byte header sits at the front of the video track; the stream is
+    then shared so video seconds == audio seconds where possible:
+
+        video capacity/s = fps*blocksize bytes   audio capacity/s = SAMPRATE*2 bytes
+        ideal duration d solves d*fps*blocksize + d*SAMPRATE*2 = stream_len + HDR_LEN
+    """
+    if blocksize <= HDR_LEN:
+        fail("pixels per frame too small to hold the 50-byte header; raise -w/-h", 6)
+    aud_bps = SAMPRATE * BYTES_PER_SAMPLE          # audio bytes per second
+    total_rate = fps * blocksize + aud_bps         # bytes per second, both tracks
+    ideal_secs = Fraction(stream_len + HDR_LEN, 1) / total_rate
+    base = int(ideal_secs * fps)               # ideal frame count (may under/overshoot by 1)
+    fps_inv = Fraction(1, 1) / fps
+    best = None
+    for frames in range(max(1, base - 2), base + 3):
+        v_capacity = frames * blocksize - HDR_LEN
+        a = stream_len - v_capacity
+        if a < 0:
+            a = 0                              # everything fits into the video track
+        if a % 2:                              # audio comes in 2-byte samples
+            a += 1                             # one odd byte slides into the video part
+        v = stream_len - a
+        if v < 0 or v > v_capacity:
+            continue
+        dur = max(Fraction(frames, 1) * fps_inv, Fraction(a, 1) / aud_bps)
+        if best is None or dur < best[0]:
+            best = (dur, frames, v, a)
+    if best is None:
+        fail("no valid split found; try different -w/-h", 6)
+    return best[1], best[2], best[3]
+
+
+def main():
+    if "--help" in sys.argv or len(sys.argv) == 1:
+        print(__doc__)
+        sys.exit(0 if "--help" in sys.argv else 2)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        fail("ffmpeg not found", 2)
+
+    # NOTE: -h is HEIGHT here (same command line as the old bash tool), so
+    # argparse's own -h help is disabled and --help is handled manually above.
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("-f", "--fps", default="1", help="framerate, e.g. 30 or 30000/1001")
+    p.add_argument("-w", "--width", type=int, default=320)
+    p.add_argument("-h", "--height", type=int, default=240)
+    p.add_argument("-c", "--codec", default="png", choices=sorted(VIDEO_CODECS))
+    p.add_argument("-n", "--no-gzip", action="store_true", help="do not gzip the stream")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("infile")
+    p.add_argument("outfile")
+    args = p.parse_args()
+
+    try:
+        fps = Fraction(args.fps)
+        if fps <= 0:
+            raise ValueError
+    except (ValueError, ZeroDivisionError):
+        fail("-f must be a positive number like 30, 29.97 or 30000/1001", 3)
+    if args.width < 1 or args.height < 1:
+        fail("-w and -h must be >= 1", 3)
+
+    ext = os.path.splitext(args.outfile)[1].lower().lstrip(".")
+    if ext not in CONTAINERS:
+        fail("outfile must end in .mkv .nut .avi .mp4 .mov or .webm", 5)
+    allowed_codecs, audio_codec = CONTAINERS[ext]
+    if args.codec not in allowed_codecs:
+        fail(f"codec {args.codec} not allowed in .{ext} (allowed here: {', '.join(sorted(allowed_codecs))})", 5)
+    if not os.access(args.infile, os.R_OK):
+        fail(f"'{args.infile}' does not exist or is not readable", 4)
+
+    outdir = os.path.dirname(os.path.abspath(args.outfile))
+    os.makedirs(outdir, exist_ok=True)
+
+    # 1) stored stream + header
+    with open(args.infile, "rb") as fh:
+        data = fh.read()
+    orig_len = len(data)
+    flag = "r" if args.no_gzip else "z"
+    stream = data if flag == "r" else gzip_bytes(data)
+    stream_len = len(stream)
+    blocksize = args.width * args.height * 3
+
+    frames, v_bytes, a_bytes = choose_split(stream_len, fps, blocksize)
+    header = (MAGIC + flag.encode() +
+              str(orig_len).zfill(15).encode() +
+              str(v_bytes).zfill(15).encode() +
+              str(a_bytes).zfill(15).encode())
+    assert len(header) == HDR_LEN and v_bytes + a_bytes == stream_len
+
+    # 2) raw feeds: video payload (+header, +zero padding to whole frames)
+    work = tempfile.mkdtemp(prefix="b2v.")
+    try:
+        video_raw = header + stream[:v_bytes]
+        video_raw += bytes(frames * blocksize - len(video_raw))
+        with open(os.path.join(work, "v.raw"), "wb") as fh:
+            fh.write(video_raw)
+
+        cmd = [ffmpeg, "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pixel_format", "rgb24",
+               "-video_size", f"{args.width}x{args.height}",
+               "-framerate", args.fps,
+               "-i", os.path.join(work, "v.raw")]
+        if a_bytes > 0:
+            with open(os.path.join(work, "a.raw"), "wb") as fh:
+                fh.write(stream[v_bytes:])
+            cmd += ["-f", "s16le", "-ar", str(SAMPRATE), "-ac", "1",
+                    "-i", os.path.join(work, "a.raw"),
+                    "-c:a", audio_codec]
+        cmd += VIDEO_CODECS[args.codec] + [args.outfile]
+        run_or_die(cmd, "encoding")
+
+        if args.verbose:
+            dur = max(Fraction(frames, 1) / fps, Fraction(a_bytes, 1) / (SAMPRATE * BYTES_PER_SAMPLE))
+            print(f"codec={args.codec} container={ext} frames={frames} fps={fps}")
+            print(f"bytes/frame: {blocksize}   split: video={v_bytes} audio={a_bytes}")
+            print(f"duration: {float(dur):.3f}s   output size: {os.path.getsize(args.outfile)}")
+            print("header:", header.decode())
+            print("input MD5 :", hashlib.md5(data).hexdigest())
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
