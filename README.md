@@ -151,3 +151,6 @@ then `./video2binary redownloaded.mp4 out.bin` — MD5 must match.
 - FLAC payload audio to give `.webm` a second slot (ffmpeg's webm muxer refuses flac today: "Only VP8 or VP9 or AV1 video and Vorbis or Opus audio")
 - 4K/60fps is ~1.5 GB/s of packing on paper — no one has to write new code for it, just `-w 3840 -h 2160 -f 60`
 - AV1 lossless via gray planes worked for density (~0.5x) but did NOT roundtrip bit-exact — ffmpeg's pixel conversions eat bytes, so it stays out on purpose
+- 4 bits/cell (`--levels 16`) measured dead for the platform route: the carrier itself can be pristine (crf 22 packs a FHD MiB into 13.5 MB bit-exact) but one real platform pass smears the 12-level spacing past the RS budget. Spacing *is* the margin — the market here stays {2, 4, 8} levels
+- pre-blurred carriers (`boxblur=2:1`): smoother cell edges make the codec only ~7% cheaper per cell, and blur leaks into the sampled cell cores — repair load went from ~0 to 27,771 bytes per MiB. Redesign cell/sample geometry before revisiting
+- audio channel as a second data lane: tone-based watermarks that survive platform transcodes run in bits-per-second — a whole video's audio carries a few hundred bytes. Worthless next to the video lane; silence stays
