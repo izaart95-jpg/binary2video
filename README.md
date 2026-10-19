@@ -125,13 +125,23 @@ video2binary data.mp4 data.out                     # same tool, auto-detected
 ```
 
 The price is honest: ~125 bytes of payload per 320x240 frame (after RS), so
-kilobytes-per-minute territory — a 1 MiB file at 30 fps is ~4.7 min of video
-(~16.3 MB out). Resolution is the sweet spot for the ratio: more payload per
-frame for nearly the same bytes — 720p carries ~1.6 kB per frame (~48 kB/s),
-turns a 1 MiB file into a 22-second 15.5 MB video with the biggest margin.
-`--levels 8` fits ~188 B per 320p frame but the carrier runs gentler and
-platform margins get tighter. `--levels 2` doubles the safety margin for
-flaky platforms.
+kilobytes-per-minute territory. Resolution barely shrinks the file (the
+codec pays per cell and the cell count follows the payload), but it scales
+the payload rate hard — same 1 MiB, levels 4, 30 fps, measured:
+
+| -y at levels 4 | output | duration | payload rate |
+|---|---|---|---|
+| 320p | 16.3 MB | 4.7 min | ~3.8 kB/s |
+| 720p | 15.5 MB | 22 s | ~48 kB/s |
+| FHD | 15.4 MB | 9.7 s | ~109 kB/s |
+| 4K | 15.1 MB | 2.4 s | ~440 kB/s |
+
+All four survive the harsh re-encode gate (Widest margins at FHD and above —
+the re-encode gets tons of bitrate to work with). For files of 10+ MiB,
+4K packs ~440 kB/s so even a 10 MiB file is a 24-second upload.
+`--levels 8` fits more per frame (a 6-second 12.6 MB FHD carrier for 1 MiB)
+but its tight spacing fails the harsh gate even at FHD — compact-but-risky
+route only. `--levels 2` doubles the safety margin for flaky platforms.
 
 To verify with your own platform: pack, upload, redownload the best quality,
 then `./video2binary redownloaded.mp4 out.bin` — MD5 must match.
