@@ -101,16 +101,21 @@ smudged the payload region, while every *flat* area came back bit-for-bit.
 - one **calibration ramp** row per frame → cells are classified by *nearest
   ramp level*, so any monotonic brightness shift (gamma, range, codec qp)
   cancels out
-- a **frame-index row** → duplicates dedupe, reorders self-heal, garbled
-  frames get skipped — because platforms re-time everything
+- a **frame-index row** → duplicates dedupe, reorders self-heal — because
+  platforms re-time everything
 - the whole stream underneath **Reed–Solomon GF(256)** (159 data + 64 parity
-  per block = 32 corrupted bytes repairable per block), gzip still optional
-- carrier: plain H.264 yuv420p `.mp4`/`.mov` with a silent AAC track — the
-  least destructive thing you can feed a platform
+  per block = 32 corrupted bytes repairable per block) and **block-interleaved**
+  across every frame — a lost or garbled frame costs a few bytes per block
+  instead of whole blocks. gzip still optional
+- carrier: plain H.264 yuv420p `.mp4`/`.mov` with a silent AAC track, x264
+  adaptive quantization off (it smears flat gray cells) and crf picked per
+  palette: 4 gray levels → crf 38, 8 → crf 33
 
 Verified against simulated platform transcodes: H.264 crf 23 and a bitrate-
 starved crf 33, VP9, AV1, 6 fps re-timing, and a 33→36-frame full shuffle
-with duplicate inserts — all bit-exact after decode.
+with duplicate inserts — all bit-exact after decode. At 1 MiB scale the
+harsh corner (carrier re-encoded again at crf 23 with default settings)
+survives too: ~12x RS headroom at 320p, ~43x at 720p.
 
 ```sh
 ./binary2video -y data.bin data.mp4                # the uploadable one
@@ -120,8 +125,13 @@ video2binary data.mp4 data.out                     # same tool, auto-detected
 ```
 
 The price is honest: ~125 bytes of payload per 320x240 frame (after RS), so
-kilobytes-per-minute territory — a 1 MiB file at 30 fps is ~4.7 min of video.
-`--levels 2` doubles the safety margin for flaky platforms.
+kilobytes-per-minute territory — a 1 MiB file at 30 fps is ~4.7 min of video
+(~16.3 MB out). Resolution is the sweet spot for the ratio: more payload per
+frame for nearly the same bytes — 720p carries ~1.6 kB per frame (~48 kB/s),
+turns a 1 MiB file into a 22-second 15.5 MB video with the biggest margin.
+`--levels 8` fits ~188 B per 320p frame but the carrier runs gentler and
+platform margins get tighter. `--levels 2` doubles the safety margin for
+flaky platforms.
 
 To verify with your own platform: pack, upload, redownload the best quality,
 then `./video2binary redownloaded.mp4 out.bin` — MD5 must match.

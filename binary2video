@@ -82,14 +82,14 @@ YT_LEVELS = {2: (40, 220),
 def b2v4_plate(frame_syms, frame_index, cols, rows, W, H, levels):
     """Paint one W x H plate: row0 = calibration ramp, row1 = frame index,
     body rows = payload symbols."""
-    img = bytearray(bytes([levels[0]]) * (W * H * 3))
+    W3 = W * 3
+    img = bytearray(bytes([levels[0]]) * W3 * H)
 
     def paint(cx, cy, v):
+        seg = bytes([v]) * (YT_CELL * 3)
         for y in range(cy * YT_CELL, (cy + 1) * YT_CELL):
-            base = (y * W + cx * YT_CELL) * 3
-            for _ in range(YT_CELL):
-                img[base] = img[base + 1] = img[base + 2] = v
-                base += 3
+            base = y * W3 + cx * YT_CELL * 3
+            img[base:base + YT_CELL * 3] = seg
 
     for c in range(cols):                                # calibration ramp
         paint(c, 0, levels[c] if c < len(levels) else levels[0])
@@ -112,17 +112,13 @@ def b2v4_plate(frame_syms, frame_index, cols, rows, W, H, levels):
 
 def bits_to_symbols(data_bytes, bps):
     """Byte stream -> bps-bit symbols (MSB-first; final symbol zero-padded)."""
-    syms = []
-    acc = n = 0
-    for byte in data_bytes:
-        for i in range(7, -1, -1):
-            acc = (acc << 1) | ((byte >> i) & 1)
-            n += 1
-            if n == bps:
-                syms.append(acc)
-                acc = n = 0
-    if n:
-        syms.append(acc << (bps - n))
+    if not data_bytes:
+        return []
+    bits = bin(int.from_bytes(data_bytes, "big"))[2:].zfill(len(data_bytes) * 8)
+    syms = [int(bits[i:i + bps], 2) for i in range(0, len(bits) - bps + 1, bps)]
+    rem = len(bits) % bps
+    if rem:
+        syms.append(int(bits[-rem:], 2) << (bps - rem))
     return syms
 
 
@@ -143,6 +139,8 @@ def platform_pack(args, fps, data):
     levels = YT_LEVELS[args.levels]
     M = len(levels)
     bps = M.bit_length() - 1
+    # Wider gray spacing tolerates a rougher carrier; tighter needs gentler.
+    crf = {2: 45, 4: 38, 8: 33}.get(M, 33)
 
     orig_len = len(data)
     flag = "r" if args.no_gzip else "z"
@@ -155,7 +153,12 @@ def platform_pack(args, fps, data):
         data_all += bytes(-len(data_all) % YT_K)          # uniform 159+64 wire
     chunks = [data_all[i:i + YT_K] for i in range(0, len(data_all), YT_K)]
     cw = b"".join(b2v_rs.rs_encode(c, YT_PARITY) for c in chunks)
-    syms = bits_to_symbols(cw, bps)
+    # Whole-block interleaving: wire position (r, col) carries byte r of every
+    # block. A lost/garbled frame then spreads its damage across ALL blocks
+    # (~0.04 B per block per lost frame) instead of killing whole codewords,
+    # and Reed-Solomon absorbs it inside its normal budget.
+    wire = b"".join(cw[r::223] for r in range(YT_K + YT_PARITY))
+    syms = bits_to_symbols(wire, bps)
 
     cells = (rows - 2) * cols                             # body cells/frame
     n_frames = max(1, -(-len(syms) // cells))
@@ -167,7 +170,8 @@ def platform_pack(args, fps, data):
          "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "pipe:0",
          "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=48000",
          "-map", "0:v", "-map", "1:a", "-shortest",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+         "-x264-params", "aq-mode=0:aq-strength=0:psy_rd=0",
          "-profile:v", "main", "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart",
          args.outfile],
